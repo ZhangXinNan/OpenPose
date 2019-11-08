@@ -1,13 +1,116 @@
+#ifdef USE_OPENCV
+#include <caffe/caffe.hpp>
 
-#include "classification.h"
-#include <cv.h>
-#include <highgui.h>
-#include "fastMath.hpp"
+#include <opencv2/core/core.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
+#include <algorithm>
+#include <iosfwd>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include <functional>
 
 using namespace cv;
 using namespace std;
-using namespace op;
+
+using namespace caffe;  // NOLINT(build/namespaces)
+using std::string;
+
+/* Pair (label, confidence) representing a prediction. */
+typedef std::pair<string, float> Prediction;
+
+// Use op::round/max/min for basic types (int, char, long, float, double, etc). Never with classes! std:: alternatives uses 'const T&' instead of 'const T' as argument.
+// E.g. std::round is really slow (~300 ms vs ~10 ms when I individually apply it to each element of a whole image array (e.g. in floatPtrToUCharCvMat)
+
+// Round functions
+// Signed
+template<typename T>
+inline char charRound(const T a)
+{
+	return char(a+0.5f);
+}
+
+template<typename T>
+inline signed char sCharRound(const T a)
+{
+	return (signed char)(a+0.5f);
+}
+
+template<typename T>
+inline int intRound(const T a)
+{
+	return int(a+0.5f);
+}
+
+template<typename T>
+inline long longRound(const T a)
+{
+	return long(a+0.5f);
+}
+
+template<typename T>
+inline long long longLongRound(const T a)
+{
+	return (long long)(a+0.5f);
+}
+
+// Unsigned
+template<typename T>
+inline unsigned char uCharRound(const T a)
+{
+	return (unsigned char)(a+0.5f);
+}
+
+template<typename T>
+inline unsigned int uIntRound(const T a)
+{
+	return (unsigned int)(a+0.5f);
+}
+
+template<typename T>
+inline unsigned long ulongRound(const T a)
+{
+	return (unsigned long)(a+0.5f);
+}
+
+template<typename T>
+inline unsigned long long uLongLongRound(const T a)
+{
+	return (unsigned long long)(a+0.5f);
+}
+
+// Max/min functions
+template<typename T>
+inline T fastMax(const T a, const T b)
+{
+	return (a > b ? a : b);
+}
+
+template<typename T>
+inline T fastMin(const T a, const T b)
+{
+	return (a < b ? a : b);
+}
+
+template<class T>
+inline T fastTruncate(T value, T min = 0, T max = 1)
+{
+	return fastMin(max, fastMax(min, value));
+}
+
+struct BlobData{
+	int count;
+	float* list;
+	int num;
+	int channels;
+	int height;
+	int width;
+	int capacity_count;		//±£Áô¿Õ¼äµÄÔªËØ¸öÊı³¤¶È£¬×Ö½ÚÊıÇë * sizeof(float)
+};
 
 #define POSE_COCO_COLORS_RENDER_GPU \
 	255.f, 0.f, 85.f, \
@@ -54,7 +157,7 @@ Mat getImage(const Mat& im, Size baseSize = Size(656, 368), float* scale = 0){
 	return bck;
 }
 
-//æ ¹æ®å¾—åˆ°çš„ç»“æœï¼Œè¿æ¥èº«ä½“åŒºåŸŸ
+//¸ù¾İµÃµ½µÄ½á¹û£¬Á¬½ÓÉíÌåÇøÓò
 void connectBodyPartsCpu(vector<float>& poseKeypoints, const float* const heatMapPtr, const float* const peaksPtr,
 	const Size& heatMapSize, const int maxPeaks, const int interMinAboveThreshold,
 	const float interThreshold, const int minSubsetCnt, const float minSubsetScore, const float scaleFactor, vector<int>& keypointShape)
@@ -342,13 +445,13 @@ void connectBodyPartsCpu(vector<float>& poseKeypoints, const float* const heatMa
 //topShape[2] = maxPeaks + 1; // # maxPeaks + 1                    97 = 96 + 1
 //topShape[3] = 3;  // X, Y, score                                 3
 
-//bottom_blobæ˜¯è¾“å…¥ï¼Œtopæ˜¯è¾“å‡º
+//bottom_blobÊÇÊäÈë£¬topÊÇÊä³ö
 void nms(BlobData* bottom_blob, BlobData* top_blob, float threshold){
-	//maxPeakså°±æ˜¯æœ€å¤§äººæ•°ï¼Œ+1æ˜¯ä¸ºäº†ç¬¬ä¸€ä½å­˜ä¸ªæ•°
-	//ç®—æ³•ï¼Œæ˜¯æ¯ä¸ªç‚¹ï¼Œå¦‚æœå¤§äºé˜ˆå€¼ï¼ŒåŒæ—¶å¤§äºä¸Šä¸‹å·¦å³å€¼çš„æ—¶å€™ï¼Œåˆ™è®¤ä¸ºæ˜¯å³°å€¼
+	//maxPeaks¾ÍÊÇ×î´óÈËÊı£¬+1ÊÇÎªÁËµÚÒ»Î»´æ¸öÊı
+	//Ëã·¨£¬ÊÇÃ¿¸öµã£¬Èç¹û´óÓÚãĞÖµ£¬Í¬Ê±´óÓÚÉÏÏÂ×óÓÒÖµµÄÊ±ºò£¬ÔòÈÏÎªÊÇ·åÖµ
 
-	//ç®—æ³•å¾ˆç®€å•ï¼Œfeaturemapçš„ä»»æ„ä¸€ä¸ªç‚¹ï¼Œå…¶ä¸Šä¸‹å·¦å³å’Œæ–œä¸Šä¸‹å·¦å³ï¼Œéƒ½å°äºè‡ªèº«ï¼Œå°±è®¤ä¸ºæ˜¯è¦çš„ç‚¹
-	//ç„¶åä»¥è¯¥ç‚¹åŒºåŸŸï¼Œé€‰æ‹©7*7åŒºåŸŸï¼ŒæŒ‰ç…§å¾—åˆ†å€¼å’Œxã€yæ¥è®¡ç®—æœ€åˆé€‚çš„äºšåƒç´ åæ ‡
+	//Ëã·¨ºÜ¼òµ¥£¬featuremapµÄÈÎÒâÒ»¸öµã£¬ÆäÉÏÏÂ×óÓÒºÍĞ±ÉÏÏÂ×óÓÒ£¬¶¼Ğ¡ÓÚ×ÔÉí£¬¾ÍÈÏÎªÊÇÒªµÄµã
+	//È»ºóÒÔ¸ÃµãÇøÓò£¬Ñ¡Ôñ7*7ÇøÓò£¬°´ÕÕµÃ·ÖÖµºÍx¡¢yÀ´¼ÆËã×îºÏÊÊµÄÑÇÏñËØ×ø±ê
 
 	int w = bottom_blob->width;
 	int h = bottom_blob->height;
@@ -379,7 +482,7 @@ void nms(BlobData* bottom_blob, BlobData* top_blob, float threshold){
 							&& value > left && value > right
 							&& value > bottomLeft && value > bottom && value > bottomRight)
 						{
-							// è®¡ç®—äºšåƒç´ åæ ‡
+							//¼ÆËãÑÇÏñËØ×ø±ê
 							float xAcc = 0;
 							float yAcc = 0;
 							float scoreAcc = 0;
@@ -496,6 +599,20 @@ void renderPoseKeypointsCpu(Mat& frame, const vector<float>& poseKeypoints, vect
 		thicknessLineRatioWRTCircle, renderThreshold, scale);
 }
 
+void setGPU(int gpu_id){
+#ifdef CPU_ONLY
+	Caffe::set_mode(Caffe::CPU);
+#else
+	if (gpu_id < 0) {
+		Caffe::set_mode(Caffe::CPU);
+	}
+	else {
+		Caffe::set_mode(Caffe::GPU);
+		Caffe::SetDevice(gpu_id);
+	}
+#endif
+}
+
 BlobData* createBlob_local(int num, int channels, int height, int width){
 	BlobData* blob = new BlobData();
 	blob->num = num;
@@ -505,6 +622,12 @@ BlobData* createBlob_local(int num, int channels, int height, int width){
 	blob->count = num*width*channels*height;
 	blob->list = new float[blob->count];
 	blob->capacity_count = blob->count;
+	return blob;
+}
+
+BlobData* createEmptyBlobData(){
+	BlobData* blob = new BlobData();
+	memset(blob, 0, sizeof(*blob));
 	return blob;
 }
 
@@ -521,75 +644,127 @@ void releaseBlob_local(BlobData** blob){
 	}
 }
 
-void main(){
-	VideoCapture cap(0);
-	Mat im, show;
+void help(){
+	printf(
+		"usage:\n"
+		"  bin imagefile gpuid[-1] base_width[656] base_height[368] [deploy] [caffemodel]\n");
+	exit(-1);
+}
 
-	if (!cap.isOpened()){
-		printf("open camera error.\n");
-		return;
+int main(int argc, char** argv){
+	if(argc < 2) help();
+
+	//disable gflags output
+	google::InitGoogleLogging("aa");
+
+	const char* image = argv[1];
+	int gpuid = argc > 2 ? atoi(argv[2]) : -1;
+	int base_width = argc > 3 ? atoi(argv[3]) : 656;
+	int base_height = argc > 4 ? atoi(argv[4]) : 368;
+	const char* deploy = argc > 5 ? argv[5] : "pose_deploy_linevec.prototxt";
+	const char* caffemodel = argc > 6 ? argv[6] : "pose_iter_440000.caffemodel";
+
+	printf(
+		"image: %s\n"
+		"deploy: %s\n"
+		"caffemodel: %s\n",
+		image, deploy, caffemodel
+	);
+
+	if(gpuid < 0)
+		printf("compute device CPU.\n");
+	else
+		printf("compute device GPU(%d).\n", gpuid);
+
+	Mat raw_image = imread(image);
+	if (raw_image.empty()){
+		printf("read image fail: %s\n", image);
+		return 0;
 	}
 
-	cap.set(CV_CAP_PROP_FOURCC, CV_FOURCC('M', 'J', 'P', 'G'));
-	cap.set(CV_CAP_PROP_FRAME_WIDTH, 640);
-	cap.set(CV_CAP_PROP_FRAME_HEIGHT, 480);
-
-	//éƒ¨åˆ†æ‘„åƒå¤´å­˜åœ¨å»¶è¿Ÿé—®é¢˜
-	while (!cap.read(im));
-
-	const char* deploy = "pose_deploy_linevec.prototxt";
-	const char* caffemodel = "pose_iter_440000.caffemodel";
-
-	//æŒ‰ç…§æ‘„åƒå¤´640*480çš„åˆ†è¾¨ç‡ï¼Œç¼©æ”¾ä¸º200*ï¼Ÿçš„å°ºå¯¸ï¼Œèµ·åˆ°åŠ é€Ÿçš„ä½œç”¨
-	Size baseSize = Size(200, 200 / 640.0 * 480);  //Size(656, 368);
+	//small size to speed up
+	Size baseSize = Size(base_width, base_height);  //Size(656, 368);
+	printf("base size = width %d x height %d\n", baseSize.width, baseSize.height);
+	setGPU(gpuid);
 
 	//initialize net
-	Classifier cls(deploy, caffemodel, 1, 0, 0, 0, 0);
-	BlobData* net_output = createEmptyBlobData();
+	Net<float>* net_ = new Net<float>(deploy, TEST);
+	net_->CopyTrainedLayersFrom(caffemodel);
+
+	Blob<float>* input_layer = net_->input_blobs()[0];
+	Size input_size(input_layer->width(), input_layer->height());
 	BlobData* nms_out = createBlob_local(1, 56, POSE_MAX_PEOPLE + 1, 3);
 	BlobData* input = createBlob_local(1, 57, baseSize.height, baseSize.width);
 	float scale = 0;
-	Mat raw_image;
 	vector<float> keypoints;
 	vector<int> shape;
+	vector<Mat> input_channels;
+	Mat im = getImage(raw_image, baseSize, &scale);
 
-	while (cap.read(raw_image)){
+	//printf("reshape size: %d, %d, %d\n", input_layer->channels(), im.rows, im.cols);
+	input_layer->Reshape(1, input_layer->channels(), im.rows, im.cols);
+	net_->Reshape();
+	input_size = Size(im.cols, im.rows);
 
-		//è·å–ä¸€å¸§å›¾ç‰‡ï¼Œæ ¹æ®çº¦å®šçš„å¤§å°ï¼Œè¿™ç§æ–¹æ³•æ˜¯ä¸ºäº†ä¿è¯å›¾åƒçš„å®½é«˜æ¯”ä¸å˜
-		im = getImage(raw_image, baseSize, &scale);
-		
-		//è¿™ä¸€æ­¥è½¬æ¢åŠ å‡å»å‡å€¼ï¼Œæ‰‹åŠ¨æ“ä½œ
-		im.convertTo(im, CV_32F, 1 / 256.f, -0.5);
-		cls.reshape(im.cols, im.rows);
-		cls.forward_raw(im);
-
-		//è·å–ç½‘ç»œè¾“å‡ºï¼Œinplace
-		cls.getBlobData("net_output", net_output);
-
-		//æŠŠheatmapç»™resizeåˆ°çº¦å®šå¤§å°
-		for (int i = 0; i < net_output->channels; ++i){
-			Mat um(baseSize.height, baseSize.width, CV_32F, input->list + baseSize.height*baseSize.width*i);
-
-			//featuremapçš„resizeæ’å€¼æ–¹æ³•å¾ˆæœ‰å…³ç³»
-			resize(Mat(net_output->height, net_output->width, CV_32F, net_output->list + net_output->width*net_output->height*i), um, baseSize, 0, 0, CV_INTER_CUBIC);
-		}
-
-		//è·å–æ¯ä¸ªfeature mapçš„å±€éƒ¨æå¤§å€¼
-		nms(input, nms_out, 0.05);
-
-		//å¾—åˆ°å±€éƒ¨æå¤§å€¼åï¼Œæ ¹æ®PAFsã€pointsåšéƒ¨ä»¶è¿æ¥
-		connectBodyPartsCpu(keypoints, input->list, nms_out->list, baseSize, POSE_MAX_PEOPLE, 9, 0.05, 3, 0.4, 1, shape);
-
-		//ç»˜å›¾ï¼Œæ˜¾ç¤º
-		renderPoseKeypointsCpu(raw_image, keypoints, shape, 0.05, scale);
-		
-		imshow("Open Pose", raw_image);
-		if (waitKey(1) == VK_ESCAPE){
-			break;
-		}
+	float* input_data = input_layer->mutable_cpu_data();
+	for (int i = 0; i < input_layer->channels() * input_layer->num(); ++i) {
+		cv::Mat channel(input_size.height, input_size.width, CV_32FC1, input_data);
+		input_channels.emplace_back(channel);
+		CHECK_EQ((void*)input_data, (void*)channel.data);
+		input_data += input_size.area();
 	}
 
-	releaseBlobData(net_output);
+	//»ñÈ¡Ò»Ö¡Í¼Æ¬£¬¸ù¾İÔ¼¶¨µÄ´óĞ¡£¬ÕâÖÖ·½·¨ÊÇÎªÁË±£Ö¤Í¼ÏñµÄ¿í¸ß±È²»±ä
+	im = getImage(raw_image, baseSize, &scale);
+	
+	//ÕâÒ»²½×ª»»¼Ó¼õÈ¥¾ùÖµ£¬ÊÖ¶¯²Ù×÷
+	im.convertTo(im, CV_32F, 1 / 256.f, -0.5);
+
+	split(im, input_channels);
+
+	double time_begin = getTickCount();
+	net_->Forward();
+
+	Blob<float>* net_output_blob = net_->blob_by_name("net_output").get();
+	const float* net_output_data_begin = net_output_blob->cpu_data();
+	double fee_time = (getTickCount() - time_begin) / getTickFrequency() * 1000;
+	printf("forward fee: %.3f ms\n", fee_time);
+
+	BlobData* net_output = createBlob_local(net_output_blob->num(), net_output_blob->channels(), net_output_blob->height(), net_output_blob->width());
+
+	//»ñÈ¡ÍøÂçÊä³ö£¬inplace
+	memcpy(net_output->list, net_output_data_begin, net_output_blob->count() * sizeof(float));
+
+	//°Ñheatmap¸øresizeµ½Ô¼¶¨´óĞ¡
+	for (int i = 0; i < net_output->channels; ++i){
+		Mat um(baseSize.height, baseSize.width, CV_32F, input->list + baseSize.height*baseSize.width*i);
+
+		//featuremapµÄresize²åÖµ·½·¨ºÜÓĞ¹ØÏµ
+		resize(Mat(net_output->height, net_output->width, CV_32F, net_output->list + net_output->width*net_output->height*i), um, baseSize, 0, 0, CV_INTER_CUBIC);
+	}
+
+	//»ñÈ¡Ã¿¸öfeature mapµÄ¾Ö²¿¼«´óÖµ
+	nms(input, nms_out, 0.05);
+
+	//µÃµ½¾Ö²¿¼«´óÖµºó£¬¸ù¾İPAFs¡¢points×ö²¿¼şÁ¬½Ó
+	connectBodyPartsCpu(keypoints, input->list, nms_out->list, baseSize, POSE_MAX_PEOPLE, 9, 0.05, 3, 0.4, 1, shape);
+
+	//printf("render to image.\n");
+	//»æÍ¼£¬ÏÔÊ¾
+	renderPoseKeypointsCpu(raw_image, keypoints, shape, 0.05, scale);
+	
+	printf("finish. save result to 'test_openpose.jpg', people: %d\n", shape[0]);
+	imwrite("test_openpose.jpg", raw_image);
+
+	releaseBlob_local(&net_output);
 	releaseBlob_local(&input);
 	releaseBlob_local(&nms_out);
+	delete net_;
+	return 1;
 }
+
+#else
+int main(int argc, char** argv) {
+  LOG(FATAL) << "This example requires OpenCV; compile with USE_OPENCV.";
+}
+#endif  // USE_OPENCV
